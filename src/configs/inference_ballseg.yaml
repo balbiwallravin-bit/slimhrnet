@@ -1,0 +1,19 @@
+defaults:
+        - _self_
+        - global
+        - runner: inference
+        - model: ballseg
+        - dataset: tabletennis
+        - dataloader: default
+        - detector: tracknetv2
+        - transform: default
+        - tracker: intra_frame_peak
+detector:
+  postprocessor:
+    use_hm_weight: False
+  step: 1
+hydra:
+  run:
+    dir: ${WASB_ROOT}/outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
+output_dir:
+seed: 1234

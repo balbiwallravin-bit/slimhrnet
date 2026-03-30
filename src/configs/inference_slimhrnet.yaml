@@ -1,0 +1,21 @@
+defaults:
+        - _self_
+        - global
+        - runner: inference
+        - model: slimhrnet
+        - dataset: tabletennis
+        - dataloader: default
+        - detector: slimhrnet
+        - transform: default
+        - tracker: online
+hydra:
+  run:
+    dir: ${WASB_ROOT}/outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
+output_dir:
+seed: 1234
+dataloader:
+  heatmap:
+    name: gaussian_point
+    sigmas: [3.0]
+    mags: [1.0]
+    min_value: 0.7
