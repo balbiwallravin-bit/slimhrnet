@@ -76,6 +76,26 @@ def extract_heatmap_tensor(preds):
     return preds
 
 
+def unwrap_model(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
+
+
+def get_visible_gpu_ids(device):
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    return list(range(torch.cuda.device_count()))
+
+
+def maybe_wrap_data_parallel(model, gpu_ids, model_name):
+    if len(gpu_ids) > 1:
+        print(f"[INFO] Using DataParallel for {model_name} on GPUs: {gpu_ids}")
+        return torch.nn.DataParallel(model, device_ids=gpu_ids, output_device=gpu_ids[0])
+    print(f"[INFO] Using a single GPU for {model_name}")
+    return model
+
+
 def load_runtime_config(config_name, device):
     with initialize_config_dir(config_dir=str(CONFIG_DIR.resolve()), version_base=None):
         cfg = compose(config_name=config_name)
@@ -172,8 +192,8 @@ def evaluate(student, val_loader, device):
 
     with torch.no_grad():
         for inp, gt_hm in val_loader:
-            inp = inp.to(device)
-            gt_hm = gt_hm.to(device)
+            inp = inp.to(device, non_blocking=(device.type == "cuda"))
+            gt_hm = gt_hm.to(device, non_blocking=(device.type == "cuda"))
 
             pred_raw = extract_heatmap_tensor(student(inp))[:, :FRAMES_IN]
             pred_hm = torch.sigmoid(pred_raw)
@@ -220,6 +240,13 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
 
+    gpu_ids = get_visible_gpu_ids(device)
+    if len(gpu_ids) > 1 and args.batch_size < len(gpu_ids):
+        print(
+            f"[WARN] batch_size={args.batch_size} is smaller than visible_gpus={len(gpu_ids)}; "
+            "some GPUs may stay idle"
+        )
+
     train_ds = BallDataset(args.train_csv, augment=True, sigma=args.sigma)
     val_ds = BallDataset(args.val_csv, augment=False, sigma=args.sigma)
 
@@ -248,6 +275,18 @@ def main():
     teacher = load_teacher(args.teacher_weights, device)
     student = load_student(device)
 
+    start_epoch = 0
+    best_val_loss = float("inf")
+    if args.resume and os.path.exists(args.resume):
+        ckpt = torch.load(args.resume, map_location="cpu")
+        student.load_state_dict(extract_state_dict(ckpt), strict=False)
+        start_epoch = ckpt.get("epoch", -1) + 1
+        best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+        print(f"[INFO] Resumed model weights from epoch {start_epoch}")
+
+    teacher = maybe_wrap_data_parallel(teacher, gpu_ids, "teacher")
+    student = maybe_wrap_data_parallel(student, gpu_ids, "student")
+
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -255,19 +294,12 @@ def main():
         eta_min=args.lr * 0.01,
     )
 
-    start_epoch = 0
-    best_val_loss = float("inf")
-
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location="cpu")
-        student.load_state_dict(extract_state_dict(ckpt), strict=False)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt.get("epoch", -1) + 1
-        best_val_loss = ckpt.get("best_val_loss", best_val_loss)
-        print(f"[INFO] Resumed training from epoch {start_epoch}")
 
     log_path = os.path.join(args.save_dir, "train_log.csv")
     log_fields = ["epoch", "train_loss", "val_loss", "val_err_hm_px", "lr", "time_min"]
@@ -321,7 +353,7 @@ def main():
         if improved:
             best_val_loss = val_loss
 
-        state_dict = student.state_dict()
+        state_dict = unwrap_model(student).state_dict()
         ckpt = {
             "epoch": epoch,
             "model": state_dict,
