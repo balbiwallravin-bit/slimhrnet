@@ -18,6 +18,9 @@ import sys
 import time
 from pathlib import Path
 
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "0")
+os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
+
 import torch
 import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
@@ -48,6 +51,8 @@ def parse_args():
         default="/home/lht/codexwork/blurball-mainyy/blurball_best.pth",
     )
     parser.add_argument("--save_dir", default="checkpoints")
+    parser.add_argument("--video_root", default="/home/lht/daqiu")
+    parser.add_argument("--frame_root", default=None)
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -92,7 +97,8 @@ def maybe_wrap_data_parallel(model, gpu_ids, model_name):
     if len(gpu_ids) > 1:
         print(f"[INFO] Using DataParallel for {model_name} on GPUs: {gpu_ids}")
         return torch.nn.DataParallel(model, device_ids=gpu_ids, output_device=gpu_ids[0])
-    print(f"[INFO] Using a single GPU for {model_name}")
+    if len(gpu_ids) == 1:
+        print(f"[INFO] Using a single GPU for {model_name}")
     return model
 
 
@@ -113,7 +119,6 @@ def load_runtime_config(config_name, device):
 
 
 def load_teacher(weights_path, device):
-    """Build and freeze the BlurBall teacher."""
     cfg = load_runtime_config("inference_blurball", device)
     teacher = build_model(cfg)
 
@@ -127,7 +132,6 @@ def load_teacher(weights_path, device):
 
 
 def load_student(device):
-    """Build the SlimHRNet student."""
     cfg = load_runtime_config("inference_slimhrnet", device)
     student = build_model(cfg)
     student = student.to(device)
@@ -137,10 +141,6 @@ def load_student(device):
 
 
 def teacher_soft_label(teacher, inp, sigma=3.0):
-    """
-    Run the teacher and convert each output channel into a Gaussian soft target.
-    Returns [B, 3, MODEL_H, MODEL_W].
-    """
     with torch.no_grad():
         hm_teacher = extract_heatmap_tensor(teacher(inp))[:, :FRAMES_IN]
         hm_sig = torch.sigmoid(hm_teacher)
@@ -180,26 +180,34 @@ def distill_loss(pred_raw, soft_label, gt_label, alpha, beta):
     return alpha * loss_soft + beta * loss_gt
 
 
+def filter_valid_batch(inp, gt_hm):
+    valid_mask = inp.abs().sum(dim=(1, 2, 3)) > 1.0
+    if valid_mask.sum().item() == 0:
+        return None, None, 0
+    return inp[valid_mask], gt_hm[valid_mask], int(valid_mask.sum().item())
+
+
 def evaluate(student, val_loader, device):
-    """
-    Report validation loss and centroid error on the current-frame channel.
-    Error is measured in output-heatmap pixels.
-    """
     student.eval()
     total_loss = 0.0
     total_err = 0.0
     count = 0
+    valid_batches = 0
 
     with torch.no_grad():
         for inp, gt_hm in val_loader:
             inp = inp.to(device, non_blocking=(device.type == "cuda"))
             gt_hm = gt_hm.to(device, non_blocking=(device.type == "cuda"))
+            inp, gt_hm, kept = filter_valid_batch(inp, gt_hm)
+            if kept == 0:
+                continue
 
             pred_raw = extract_heatmap_tensor(student(inp))[:, :FRAMES_IN]
             pred_hm = torch.sigmoid(pred_raw)
 
             loss = F.mse_loss(pred_hm, gt_hm)
             total_loss += loss.item()
+            valid_batches += 1
 
             _, _, height, width = pred_hm.shape
             grid_y, grid_x = torch.meshgrid(
@@ -229,8 +237,7 @@ def evaluate(student, val_loader, device):
                 total_err += err
                 count += 1
 
-    num_batches = max(len(val_loader), 1)
-    mean_loss = total_loss / num_batches
+    mean_loss = total_loss / max(valid_batches, 1)
     mean_err = total_err / max(count, 1)
     return mean_loss, mean_err
 
@@ -247,8 +254,20 @@ def main():
             "some GPUs may stay idle"
         )
 
-    train_ds = BallDataset(args.train_csv, augment=True, sigma=args.sigma)
-    val_ds = BallDataset(args.val_csv, augment=False, sigma=args.sigma)
+    train_ds = BallDataset(
+        args.train_csv,
+        augment=True,
+        sigma=args.sigma,
+        video_root=args.video_root,
+        frame_root=args.frame_root,
+    )
+    val_ds = BallDataset(
+        args.val_csv,
+        augment=False,
+        sigma=args.sigma,
+        video_root=args.video_root,
+        frame_root=args.frame_root,
+    )
 
     if len(train_ds) == 0:
         raise ValueError(f"Training dataset is empty: {args.train_csv}")
@@ -263,6 +282,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         drop_last=len(train_ds) >= args.batch_size,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
@@ -270,6 +290,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
+        persistent_workers=args.num_workers > 0,
     )
 
     teacher = load_teacher(args.teacher_weights, device)
@@ -311,10 +332,16 @@ def main():
         student.train()
         t0 = time.time()
         total_train_loss = 0.0
+        valid_train_batches = 0
+        skipped_train_batches = 0
 
         for batch_index, (inp, gt_hm) in enumerate(train_loader):
             inp = inp.to(device, non_blocking=pin_memory)
             gt_hm = gt_hm.to(device, non_blocking=pin_memory)
+            inp, gt_hm, kept = filter_valid_batch(inp, gt_hm)
+            if kept == 0:
+                skipped_train_batches += 1
+                continue
 
             soft_lbl = teacher_soft_label(teacher, inp, sigma=args.sigma)
             pred_raw = extract_heatmap_tensor(student(inp))[:, :FRAMES_IN]
@@ -326,18 +353,19 @@ def main():
             optimizer.step()
 
             total_train_loss += loss.item()
+            valid_train_batches += 1
 
             if (batch_index + 1) % 50 == 0:
-                avg_loss = total_train_loss / (batch_index + 1)
+                avg_loss = total_train_loss / max(valid_train_batches, 1)
                 print(
                     f"  Epoch {epoch + 1} [{batch_index + 1}/{len(train_loader)}] "
-                    f"loss={avg_loss:.5f}"
+                    f"loss={avg_loss:.5f} | skipped={skipped_train_batches}"
                 )
 
         scheduler.step()
 
         val_loss, val_err = evaluate(student, val_loader, device)
-        train_loss = total_train_loss / max(len(train_loader), 1)
+        train_loss = total_train_loss / max(valid_train_batches, 1)
         elapsed_min = (time.time() - t0) / 60.0
 
         print(
@@ -346,6 +374,7 @@ def main():
             f"val_loss={val_loss:.5f} | "
             f"val_err={val_err:.2f}px | "
             f"lr={scheduler.get_last_lr()[0]:.2e} | "
+            f"skipped={skipped_train_batches} | "
             f"{elapsed_min:.1f}min"
         )
 

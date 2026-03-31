@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "0")
+
 import cv2
 import numpy as np
 import torch
@@ -34,18 +36,12 @@ from models import build_model  # noqa: E402
 
 CROP_X1, CROP_Y1 = 367, 100
 CROP_X2, CROP_Y2 = 1760, 750
-CROP_W = CROP_X2 - CROP_X1
-CROP_H = CROP_Y2 - CROP_Y1
-
 MODEL_W, MODEL_H = 512, 288
 FRAMES_IN = 3
 
-# In this repo, HRNet/BlurBall defaults to full-resolution heatmaps.
-HM_W = MODEL_W
-HM_H = MODEL_H
-
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+ZERO_FRAME = torch.zeros(3, MODEL_H, MODEL_W, dtype=torch.float32)
 
 
 def parse_args():
@@ -113,9 +109,6 @@ def load_runtime_config(config_name, device):
 
 
 def load_blurball_model(weights_path, device):
-    """
-    Build the local BlurBall architecture and load teacher weights into it.
-    """
     cfg = load_runtime_config("inference_blurball", device)
     model = build_model(cfg)
 
@@ -126,23 +119,29 @@ def load_blurball_model(weights_path, device):
     return model
 
 
+def is_invalid_tensor(tensor):
+    return tensor.abs().sum().item() < 1e-3
+
+
 def preprocess_frame(frame_bgr):
-    """
-    Read an OpenCV BGR frame, crop, resize, and normalize to [3, MODEL_H, MODEL_W].
-    """
+    """Crop, resize, and normalize a decoded BGR frame."""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return ZERO_FRAME.clone()
+
     cropped = frame_bgr[CROP_Y1:CROP_Y2, CROP_X1:CROP_X2]
+    if cropped.size == 0:
+        return ZERO_FRAME.clone()
+
     resized = cv2.resize(cropped, (MODEL_W, MODEL_H), interpolation=cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     tensor = torch.from_numpy(rgb).permute(2, 0, 1)
     tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
+    if is_invalid_tensor(tensor):
+        return ZERO_FRAME.clone()
     return tensor
 
 
 def extract_primary_heatmap(preds):
-    """
-    Current BlurBall/HRNet returns {scale: tensor}. We only use scale 0.
-    Shape: [B, C, H, W]
-    """
     if isinstance(preds, dict):
         if 0 not in preds:
             raise KeyError("Model output does not contain scale=0")
@@ -151,10 +150,6 @@ def extract_primary_heatmap(preds):
 
 
 def decode_heatmap(hm_tensor, score_threshold):
-    """
-    Decode a single heatmap into normalized coordinates.
-    Returns (cx_norm, cy_norm, score) or None.
-    """
     hm = torch.sigmoid(hm_tensor)
     score = hm.max().item()
     if score < score_threshold:
@@ -181,10 +176,6 @@ def decode_heatmap(hm_tensor, score_threshold):
 
 
 def process_video(model, video_path, step, score_threshold, device):
-    """
-    Return a list of label rows for one video.
-    Each row contains frame_idx, cx_norm, cy_norm, and score.
-    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[WARN] Cannot open video: {video_path}")
@@ -193,14 +184,27 @@ def process_video(model, video_path, step, score_threshold, device):
     records = []
     frame_buffer = []
     frame_idx = 0
+    consecutive_failures = 0
 
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
-            break
+            consecutive_failures += 1
+            if consecutive_failures > 8:
+                break
+            frame_idx += 1
+            continue
+        consecutive_failures = 0
 
         if frame_idx % step == 0:
             tensor = preprocess_frame(frame_bgr)
+            if is_invalid_tensor(tensor):
+                if frame_buffer:
+                    tensor = frame_buffer[-1].clone()
+                else:
+                    frame_idx += 1
+                    continue
+
             frame_buffer.append(tensor)
             if len(frame_buffer) > FRAMES_IN:
                 frame_buffer.pop(0)
@@ -211,7 +215,6 @@ def process_video(model, video_path, step, score_threshold, device):
                     preds = model(inp)
 
                 hm_out = extract_primary_heatmap(preds)
-                # Keep only the current frame, i.e. the last output channel.
                 result = decode_heatmap(hm_out[0, FRAMES_IN - 1], score_threshold)
                 if result is not None:
                     cx_norm, cy_norm, score = result
