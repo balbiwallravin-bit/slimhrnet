@@ -172,7 +172,7 @@ def inference_video(
             )
             hm_path = (
                 osp.join(vis_hm_dir, osp.basename(img_path))
-                if vis_frame_dir is not None
+                if vis_hm_dir is not None
                 else None
             )
             vis_gt = cv2.imread(img_path)
@@ -242,7 +242,8 @@ def inference_video(
             # vis = np.hstack((vis_gt, vis_pred))
             vis = vis_pred
             cv2.imwrite(vis_frame_path, vis)
-            cv2.imwrite(hm_path, vis_hm_pred)
+            if hm_path is not None:
+                cv2.imwrite(hm_path, vis_hm_pred)
 
         # if vis_traj_path is not None:
         #     color_pred = (
@@ -337,3 +338,4 @@ class NewVideosInferenceRunner(BaseRunner):
         num_frames_all += tmp["num_frames"]
 
         return
+
