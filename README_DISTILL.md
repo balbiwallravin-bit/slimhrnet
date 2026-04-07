@@ -1,0 +1,263 @@
+# SlimHRNet Distillation Workflow
+
+This document records the custom pseudo-label, distillation, testing, and benchmarking flow added in this fork.
+
+## What Was Added
+
+The following scripts were added or updated for the custom SlimHRNet student workflow:
+
+- `tools/auto_label.py`: generate pseudo labels from TS videos with the BlurBall teacher.
+- `tools/clean_labels.py`: clean the raw pseudo labels.
+- `tools/split_dataset.py`: split labels by video into train/val/test CSVs.
+- `tools/extract_frames.py`: extract cropped+resized JPEG frames for stable training.
+- `src/datasets/ball_dataset.py`: dataset for distilled training, preferring extracted JPEGs and falling back to videos.
+- `tools/train_distill.py`: multi-GPU distillation training.
+- `tools/test_videos.py`: batch visual test helper for sampled videos plus per-video speed summary.
+- `benchmark_speed.py`: synthetic preprocessing/model/postprocess latency benchmark.
+- `benchmark_video_pipeline.py`: end-to-end timing benchmark on real videos.
+
+## Why The Frame Extraction Step Exists
+
+Random `cv2.VideoCapture(...); cap.set(CAP_PROP_POS_FRAMES, idx)` seeks are fragile on `.ts` videos and can trigger FFmpeg warnings such as missing reference frames. The custom workflow therefore prefers:
+
+1. Extract JPEGs once with `tools/extract_frames.py`.
+2. Train from JPEGs with `--frame_root`.
+3. Fall back to video decoding only if a JPEG is missing.
+
+This makes training more stable and usually faster.
+
+## Training Workflow
+
+Assumed paths used below:
+
+- repo: `/home/lht/codexwork/slimhrnet`
+- teacher weights: `/home/lht/codexwork/blurball-mainyy/blurball_best.pth`
+- raw videos: `/home/lht/daqiu`
+- extracted JPEGs: `/home/lht/daqiu_frames`
+
+Activate the environment first:
+
+```bash
+cd /home/lht/codexwork/slimhrnet
+conda activate blurball
+```
+
+### 1. Generate raw pseudo labels
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/auto_label.py \
+    --video_root /home/lht/daqiu \
+    --weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
+    --output_csv data/pseudo_labels_raw.csv \
+    --step 3 \
+    --score_threshold 0.4 \
+    --device cuda | tee auto_label.log
+```
+
+### 2. Clean the pseudo labels
+
+Balanced cleaning settings used in practice:
+
+```bash
+python tools/clean_labels.py \
+    --input_csv data/pseudo_labels_raw.csv \
+    --output_csv data/pseudo_labels_clean_balanced.csv \
+    --min_score 0.50 \
+    --max_jump 0.18 \
+    --min_coverage 0.02 | tee clean_labels_balanced.log
+```
+
+### 3. Split train / val / test by video
+
+```bash
+python tools/split_dataset.py \
+    --input_csv data/pseudo_labels_clean_balanced.csv \
+    --output_dir data/splits_balanced | tee split_dataset_balanced.log
+```
+
+### 4. Extract cropped JPEG frames
+
+```bash
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/extract_frames.py \
+    --video_root /home/lht/daqiu \
+    --output_root /home/lht/daqiu_frames \
+    --step 3 | tee extract_frames.log
+```
+
+### 5. Train the student with distillation
+
+Example using 3 GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,7 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/train_distill.py \
+    --train_csv data/splits_balanced/train.csv \
+    --val_csv data/splits_balanced/val.csv \
+    --teacher_weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
+    --save_dir checkpoints_balanced \
+    --video_root /home/lht/daqiu \
+    --frame_root /home/lht/daqiu_frames \
+    --epochs 80 \
+    --batch_size 24 \
+    --lr 1e-3 \
+    --num_workers 8 \
+    --alpha 0.7 \
+    --beta 0.3 \
+    --sigma 3.0 \
+    --device cuda | tee train_distill_balanced.log
+```
+
+Resume training:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,7 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/train_distill.py \
+    --train_csv data/splits_balanced/train.csv \
+    --val_csv data/splits_balanced/val.csv \
+    --teacher_weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
+    --save_dir checkpoints_balanced \
+    --video_root /home/lht/daqiu \
+    --frame_root /home/lht/daqiu_frames \
+    --epochs 80 \
+    --batch_size 24 \
+    --lr 1e-3 \
+    --num_workers 8 \
+    --alpha 0.7 \
+    --beta 0.3 \
+    --sigma 3.0 \
+    --device cuda \
+    --resume checkpoints_balanced/latest.pth | tee train_distill_balanced_resume.log
+```
+
+## Visual Testing On Real Videos
+
+Use `tools/test_videos.py` to:
+
+- optionally force-include one specific video
+- randomly sample more videos from a folder
+- run tracking inference
+- save rendered output videos and `traj.csv`
+- write a per-video speed summary CSV
+
+### Example: specific video + 5 random videos from `/home/lht/ceshi`
+
+```bash
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/test_videos.py \
+    --config-name inference_slimhrnet \
+    --model-path checkpoints_balanced/best.pth \
+    --video-dir /home/lht/ceshi \
+    --include-video /home/lht/ceshi/D1_S20251015112330_E20251015112400.mp4 \
+    --num-random 5 \
+    --gpus 0 \
+    --output-dir video_test_outputs/slimhrnet_check | tee test_videos.log
+```
+
+Notes:
+
+- `--num-random 5` means the forced video plus 5 additional random videos, so up to 6 outputs total.
+- If you want exactly 5 total including the forced video, use `--num-random 4`.
+- Outputs are stored under the chosen `--output-dir`.
+- The script also writes `selected_videos.txt` and `summary.csv`.
+
+The generated layout looks like this:
+
+```text
+video_test_outputs/slimhrnet_check/
+  selected_videos.txt
+  summary.csv
+  <relative_video_path_without_suffix>/
+    result.mp4
+    traj.csv
+```
+
+## Speed Benchmarks
+
+### 1. Synthetic end-to-end latency benchmark
+
+This uses a synthetic input image and reports preprocess/model/postprocess latency.
+
+```bash
+CUDA_VISIBLE_DEVICES=4 \
+python benchmark_speed.py \
+    --model slimhrnet \
+    --weights checkpoints_balanced/best.pth \
+    --device cuda \
+    --full_pipeline \
+    --input_orig_h 1080 \
+    --input_orig_w 1920
+```
+
+### 2. Real video pipeline timing benchmark
+
+This measures real preprocessing + model + postprocess + tracking time on videos.
+
+```bash
+CUDA_VISIBLE_DEVICES=4 \
+python benchmark_video_pipeline.py \
+    --config-name inference_slimhrnet \
+    --model-path checkpoints_balanced/best.pth \
+    --videos-dir /home/lht/ceshi \
+    --video-glob "**/*.mp4" \
+    --gpus 0 \
+    --output-csv benchmark_video_pipeline_slimhrnet.csv
+```
+
+## Quick Smoke Test
+
+Before a long run, it can be useful to verify that one batch can load and backpropagate:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python - <<'PY'
+import torch
+from torch.utils.data import DataLoader
+from tools.train_distill import BallDataset, load_teacher, load_student, teacher_soft_label, extract_heatmap_tensor, distill_loss
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ds = BallDataset(
+    "data/splits_balanced/train.csv",
+    augment=False,
+    sigma=3.0,
+    video_root="/home/lht/daqiu",
+    frame_root="/home/lht/daqiu_frames",
+)
+loader = DataLoader(ds, batch_size=6, shuffle=True, num_workers=2, pin_memory=(device.type == "cuda"))
+inp, gt_hm = next(iter(loader))
+valid_mask = inp.abs().sum(dim=(1, 2, 3)) > 1.0
+inp = inp[valid_mask].to(device)
+gt_hm = gt_hm[valid_mask].to(device)
+teacher = load_teacher("/home/lht/codexwork/blurball-mainyy/blurball_best.pth", device)
+student = load_student(device)
+soft_lbl = teacher_soft_label(teacher, inp, sigma=3.0)
+pred_raw = extract_heatmap_tensor(student(inp))[:, :3]
+loss = distill_loss(pred_raw, soft_lbl, gt_hm, 0.7, 0.3)
+loss.backward()
+print("SMOKE_TEST_OK")
+print("input_shape=", tuple(inp.shape))
+print("gt_shape=", tuple(gt_hm.shape))
+print("loss=", float(loss))
+PY
+```
+
+
