@@ -249,6 +249,9 @@ def main():
             row["raw_frames"] = count_video_frames(video_path)
             cleanup_dir(temp_vis_dir)
             cleanup_dir(temp_hm_dir)
+            temp_vis_dir.mkdir(parents=True, exist_ok=True)
+            if args.save_heatmaps:
+                temp_hm_dir.mkdir(parents=True, exist_ok=True)
 
             prep_start = time.perf_counter()
             temp_frame_dir = Path(process_video(str(video_path), filter=args.filter_duplicates))
@@ -313,3 +316,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

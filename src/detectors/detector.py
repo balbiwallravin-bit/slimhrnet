@@ -18,6 +18,12 @@ from .gaussian_postprocessor import GaussianPostprocessor
 log = logging.getLogger(__name__)
 
 
+def load_checkpoint_compat(model_path, map_location):
+    try:
+        return torch.load(model_path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(model_path, map_location=map_location)
+
 class TracknetV2Detector(object):
     __postprocessor_factory = {
         "tracknetv2": TracknetV2Postprocessor,
@@ -70,7 +76,7 @@ class TracknetV2Detector(object):
                 )
                 if not osp.exists(model_path):
                     FileNotFoundError("{} not found".format(model_path))
-            checkpoint = torch.load(model_path, map_location="cuda:0")
+            checkpoint = load_checkpoint_compat(model_path, map_location="cuda:0")
             self._model.load_state_dict(checkpoint["model_state_dict"])
             self._model = self._model.to(self._device)
             self._model = nn.DataParallel(self._model, device_ids=self._gpus)
@@ -122,3 +128,5 @@ class TracknetV2Detector(object):
                     hms_vis[bid][eid].append({"hm": hm, "scale": scale, "trans": trans})
 
         return results, hms_vis
+
+
