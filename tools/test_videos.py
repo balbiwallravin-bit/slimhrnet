@@ -1,6 +1,6 @@
 """
-Sample videos from a directory, run tracking inference, save visualized videos,
-and write a speed summary CSV.
+Sample videos from a directory, run tracking inference with sequential video reads,
+optionally render a result video as a post-process step, and write a speed summary CSV.
 
 Example:
   python tools/test_videos.py \
@@ -17,15 +17,18 @@ import argparse
 import csv
 import os
 import random
-import shutil
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "0")
 os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
 
 import cv2
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -36,12 +39,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from detectors import build_detector  # noqa: E402
-from runners.inference import inference_video  # noqa: E402
 from trackers import build_tracker  # noqa: E402
-from utils.preprocess import process_video  # noqa: E402
 
 
 VIDEO_EXTENSIONS = [".mp4", ".ts", ".avi", ".mov", ".mkv"]
+CROP_X1, CROP_Y1 = 367, 100
+CROP_X2, CROP_Y2 = 1760, 750
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
 def parse_args():
@@ -58,9 +63,7 @@ def parse_args():
     parser.add_argument("--score-threshold", type=float, default=None)
     parser.add_argument("--output-dir", default="video_test_outputs")
     parser.add_argument("--summary-csv", default=None)
-    parser.add_argument("--keep-temp-frames", action="store_true")
-    parser.add_argument("--filter-duplicates", action="store_true")
-    parser.add_argument("--save-heatmaps", action="store_true")
+    parser.add_argument("--skip-render", action="store_true", help="Skip post-rendered result.mp4 generation.")
     return parser.parse_args()
 
 
@@ -87,8 +90,8 @@ def get_config(args):
     OmegaConf.set_struct(cfg, False)
     cfg.runner.device = args.device
     cfg.runner.gpus = parse_gpus(args.gpus)
-    cfg.runner.vis_result = True
-    cfg.runner.vis_hm = args.save_heatmaps
+    cfg.runner.vis_result = False
+    cfg.runner.vis_hm = False
     cfg.runner.vis_traj = False
     cfg.detector.model_path = str(Path(args.model_path).resolve())
     if args.step is not None:
@@ -110,16 +113,14 @@ def list_candidate_videos(video_dir):
     for extension in VIDEO_EXTENSIONS:
         videos.extend(video_dir.rglob(f"*{extension}"))
         videos.extend(video_dir.rglob(f"*{extension.upper()}"))
-    videos = sorted({video.resolve() for video in videos})
-    return videos
+    return sorted({video.resolve() for video in videos})
 
 
 def select_videos(args):
     rng = random.Random(args.seed)
-    video_dir = Path(args.video_dir).resolve()
-    candidates = list_candidate_videos(video_dir)
+    candidates = list_candidate_videos(args.video_dir)
     if not candidates:
-        raise FileNotFoundError(f"No videos found under {video_dir}")
+        raise FileNotFoundError(f"No videos found under {Path(args.video_dir).resolve()}")
 
     selected = []
     include_video = None
@@ -131,14 +132,17 @@ def select_videos(args):
 
     remaining = [video for video in candidates if video != include_video]
     if args.num_random > 0:
-        sample_count = min(args.num_random, len(remaining))
-        selected.extend(rng.sample(remaining, sample_count))
+        selected.extend(rng.sample(remaining, min(args.num_random, len(remaining))))
 
     if not selected:
         raise ValueError("No videos selected")
 
-    selected = sorted(dict.fromkeys(selected))
-    return selected
+    return sorted(dict.fromkeys(selected))
+
+
+def sync_if_needed(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def count_video_frames(video_path):
@@ -150,25 +154,244 @@ def count_video_frames(video_path):
     return frame_count
 
 
-def count_csv_rows(csv_path):
-    if not csv_path.exists():
-        return 0
-    with csv_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return sum(1 for _ in reader)
-
-
-def cleanup_dir(path):
-    path = Path(path)
-    if path.exists() and path.is_dir():
-        shutil.rmtree(path)
-
-
 def safe_relative(path, root):
     try:
-        return path.resolve().relative_to(root.resolve())
+        return path.resolve().relative_to(Path(root).resolve())
     except ValueError:
         return Path(path.name)
+
+
+def safe_coord(value):
+    if value is None or not np.isfinite(value):
+        return 0
+    return int(round(float(value)))
+
+
+def safe_score(value):
+    if value is None or not np.isfinite(value):
+        return 0.0
+    return float(value)
+
+
+def build_crop_affine_tensor(cfg):
+    inp_w = int(cfg.model.inp_width)
+    inp_h = int(cfg.model.inp_height)
+    crop_w = CROP_X2 - CROP_X1
+    crop_h = CROP_Y2 - CROP_Y1
+    sx = (crop_w - 1) / max(inp_w - 1, 1)
+    sy = (crop_h - 1) / max(inp_h - 1, 1)
+    trans_single = np.array(
+        [
+            [sx, 0.0, float(CROP_X1)],
+            [0.0, sy, float(CROP_Y1)],
+        ],
+        dtype=np.float32,
+    )
+    trans = np.stack([trans_single for _ in range(int(cfg.model.frames_out))], axis=0)
+    return torch.tensor(trans, dtype=torch.float32).unsqueeze(0)
+
+
+def preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std):
+    raw_cpu = torch.from_numpy(frame_bgr).permute(2, 0, 1).contiguous()
+    if device.type == "cuda":
+        raw_cpu = raw_cpu.pin_memory()
+    raw_gpu = raw_cpu.to(device, non_blocking=(device.type == "cuda"))
+
+    _, height, width = raw_gpu.shape
+    x1 = max(0, min(CROP_X1, width - 1))
+    x2 = max(x1 + 1, min(CROP_X2, width))
+    y1 = max(0, min(CROP_Y1, height - 1))
+    y2 = max(y1 + 1, min(CROP_Y2, height))
+
+    cropped = raw_gpu[:, y1:y2, x1:x2]
+    rgb = cropped[[2, 1, 0], ...]
+    resized = TF.resize(
+        rgb,
+        [input_h, input_w],
+        interpolation=TF.InterpolationMode.BILINEAR,
+        antialias=False,
+    )
+    resized = resized.float() / 255.0
+    resized = (resized - mean) / std
+    return resized
+
+
+def write_traj_csv(rows, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["Frame", "X", "Y", "Visibility", "Score"]
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def render_video_postprocess(video_path, traj_rows, output_path):
+    pred_map = {int(row["Frame"]): row for row in traj_rows}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open video for rendering: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"failed to open video writer: {output_path}")
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        pred = pred_map.get(frame_idx)
+        if pred is not None and int(pred["Visibility"]) == 1:
+            x = safe_coord(pred["X"])
+            y = safe_coord(pred["Y"])
+            x = max(0, min(x, width - 1))
+            y = max(0, min(y, height - 1))
+            score = safe_score(pred.get("Score", 0.0))
+            cv2.circle(frame, (x, y), 8, (0, 0, 255), 2)
+            cv2.putText(
+                frame,
+                f"ball {score:.2f}",
+                (max(0, x - 30), max(20, y - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        writer.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+
+
+def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render):
+    video_path = Path(video_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    traj_csv = output_dir / "traj.csv"
+    result_video = output_dir / "result.mp4"
+
+    device = torch.device(detector._device)
+    mean = IMAGENET_MEAN.to(device)
+    std = IMAGENET_STD.to(device)
+    input_h = int(cfg.model.inp_height)
+    input_w = int(cfg.model.inp_width)
+    step = int(cfg.detector.step)
+    frames_in = int(cfg.model.frames_in)
+    affine = build_crop_affine_tensor(cfg)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open video: {video_path}")
+
+    raw_frames_reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    det_results = defaultdict(list)
+    frame_ids_buffer = []
+    frame_tensors_buffer = []
+    actual_frame_count = 0
+    preprocess_sec = 0.0
+
+    infer_start = time.perf_counter()
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        sync_if_needed(device)
+        t_pre = time.perf_counter()
+        frame_tensor = preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std)
+        sync_if_needed(device)
+        preprocess_sec += time.perf_counter() - t_pre
+
+        frame_ids_buffer.append(actual_frame_count)
+        frame_tensors_buffer.append(frame_tensor)
+
+        if len(frame_tensors_buffer) == frames_in:
+            input_tensor = torch.cat(frame_tensors_buffer, dim=0).unsqueeze(0)
+            batch_results, _ = detector.run_tensor(input_tensor, affine)
+            for elem_idx in sorted(batch_results[0].keys()):
+                det_results[frame_ids_buffer[elem_idx]].extend(batch_results[0][elem_idx])
+
+            if step == 1:
+                frame_ids_buffer.pop(0)
+                frame_tensors_buffer.pop(0)
+            elif step == 3:
+                frame_ids_buffer = []
+                frame_tensors_buffer = []
+            else:
+                cap.release()
+                raise ValueError(f"unsupported detector.step={step}")
+
+        actual_frame_count += 1
+
+    cap.release()
+
+    tracker.refresh()
+    track_start = time.perf_counter()
+    traj_rows = []
+    for frame_id in sorted(det_results.keys()):
+        result = tracker.update(det_results[frame_id])
+        traj_rows.append(
+            {
+                "Frame": frame_id,
+                "X": safe_coord(result.get("x")),
+                "Y": safe_coord(result.get("y")),
+                "Visibility": int(bool(result.get("visi", False))),
+                "Score": round(safe_score(result.get("score")), 6),
+            }
+        )
+    track_sec = time.perf_counter() - track_start
+    inference_sec = time.perf_counter() - infer_start
+
+    write_traj_csv(traj_rows, traj_csv)
+
+    render_sec = 0.0
+    if not skip_render:
+        render_start = time.perf_counter()
+        render_video_postprocess(video_path, traj_rows, result_video)
+        render_sec = time.perf_counter() - render_start
+
+    wall_total_sec = inference_sec + render_sec
+    predicted_frames = len(traj_rows)
+
+    row = {
+        "video": str(video_path),
+        "status": "ok",
+        "error": "",
+        "raw_frames": actual_frame_count if actual_frame_count > 0 else raw_frames_reported,
+        "unique_frames": actual_frame_count if actual_frame_count > 0 else raw_frames_reported,
+        "predicted_frames": predicted_frames,
+        "preprocess_sec": round(preprocess_sec, 6),
+        "inference_sec": round(inference_sec, 6),
+        "tracking_sec": round(track_sec, 6),
+        "render_sec": round(render_sec, 6),
+        "wall_total_sec": round(wall_total_sec, 6),
+        "fps_inference": round(predicted_frames / max(inference_sec, 1e-6), 4),
+        "fps_wall": round(predicted_frames / max(wall_total_sec, 1e-6), 4),
+        "result_video": "" if skip_render else str(result_video),
+        "traj_csv": str(traj_csv),
+    }
+    return row
 
 
 def write_summary(rows, output_csv):
@@ -183,6 +406,8 @@ def write_summary(rows, output_csv):
         "predicted_frames",
         "preprocess_sec",
         "inference_sec",
+        "tracking_sec",
+        "render_sec",
         "wall_total_sec",
         "fps_inference",
         "fps_wall",
@@ -203,10 +428,9 @@ def main():
 
     output_root = Path(args.output_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-
     summary_csv = Path(args.summary_csv).resolve() if args.summary_csv else output_root / "summary.csv"
-    selected = select_videos(args)
 
+    selected = select_videos(args)
     selected_txt = output_root / "selected_videos.txt"
     selected_txt.write_text("\n".join(str(video) for video in selected) + "\n", encoding="utf-8")
 
@@ -216,97 +440,43 @@ def main():
 
     rows = []
     video_root = Path(args.video_dir).resolve()
-
     for video_path in selected:
         rel = safe_relative(video_path, video_root)
         video_out_dir = output_root / rel.with_suffix("")
-        video_out_dir.mkdir(parents=True, exist_ok=True)
-
-        temp_frame_dir = None
-        temp_vis_dir = video_out_dir / "result_frames"
-        temp_hm_dir = video_out_dir / "heatmaps"
-        traj_copy = video_out_dir / "traj.csv"
-        result_video = video_out_dir / "result.mp4"
-
-        row = {
-            "video": str(video_path),
-            "status": "ok",
-            "error": "",
-            "raw_frames": 0,
-            "unique_frames": 0,
-            "predicted_frames": 0,
-            "preprocess_sec": 0.0,
-            "inference_sec": 0.0,
-            "wall_total_sec": 0.0,
-            "fps_inference": 0.0,
-            "fps_wall": 0.0,
-            "result_video": "",
-            "traj_csv": "",
-        }
-
-        wall_start = time.perf_counter()
         try:
-            row["raw_frames"] = count_video_frames(video_path)
-            cleanup_dir(temp_vis_dir)
-            cleanup_dir(temp_hm_dir)
-            temp_vis_dir.mkdir(parents=True, exist_ok=True)
-            if args.save_heatmaps:
-                temp_hm_dir.mkdir(parents=True, exist_ok=True)
-
-            prep_start = time.perf_counter()
-            temp_frame_dir = Path(process_video(str(video_path), filter=args.filter_duplicates))
-            row["preprocess_sec"] = time.perf_counter() - prep_start
-            row["unique_frames"] = len(list(temp_frame_dir.glob("*.png")))
-
-            infer_ret = inference_video(
+            row = run_single_video(
+                cfg,
                 detector,
                 tracker,
-                str(video_path),
-                str(temp_frame_dir),
-                cfg,
-                vis_frame_dir=str(temp_vis_dir),
-                vis_hm_dir=str(temp_hm_dir) if args.save_heatmaps else None,
+                video_path,
+                video_out_dir,
+                skip_render=args.skip_render,
             )
-            row["inference_sec"] = float(infer_ret.get("t_elapsed", 0.0))
-            row["wall_total_sec"] = time.perf_counter() - wall_start
-
-            traj_src = temp_frame_dir / "traj.csv"
-            if traj_src.exists():
-                shutil.copy2(traj_src, traj_copy)
-                row["traj_csv"] = str(traj_copy)
-                row["predicted_frames"] = count_csv_rows(traj_copy)
-
-            generated_video = Path(str(temp_vis_dir) + ".mp4")
-            if generated_video.exists():
-                if result_video.exists():
-                    result_video.unlink()
-                shutil.move(str(generated_video), str(result_video))
-                row["result_video"] = str(result_video)
-
-            if row["inference_sec"] > 0:
-                row["fps_inference"] = row["predicted_frames"] / row["inference_sec"]
-            if row["wall_total_sec"] > 0:
-                row["fps_wall"] = row["predicted_frames"] / row["wall_total_sec"]
-
             print(
-                f"[OK] {video_path.name} | "
+                f"[OK] {Path(video_path).name} | "
                 f"predicted_frames={row['predicted_frames']} | "
                 f"fps_inference={row['fps_inference']:.2f} | "
                 f"fps_wall={row['fps_wall']:.2f}"
             )
         except Exception as exc:
-            row["status"] = "error"
-            row["error"] = str(exc)
-            row["wall_total_sec"] = time.perf_counter() - wall_start
+            row = {
+                "video": str(Path(video_path).resolve()),
+                "status": "error",
+                "error": str(exc),
+                "raw_frames": 0,
+                "unique_frames": 0,
+                "predicted_frames": 0,
+                "preprocess_sec": 0.0,
+                "inference_sec": 0.0,
+                "tracking_sec": 0.0,
+                "render_sec": 0.0,
+                "wall_total_sec": 0.0,
+                "fps_inference": 0.0,
+                "fps_wall": 0.0,
+                "result_video": "",
+                "traj_csv": "",
+            }
             print(f"[ERROR] {video_path}: {exc}")
-        finally:
-            if not args.keep_temp_frames and temp_frame_dir is not None:
-                cleanup_dir(temp_frame_dir)
-            if not args.keep_temp_frames:
-                cleanup_dir(temp_vis_dir)
-                if args.save_heatmaps:
-                    cleanup_dir(temp_hm_dir)
-
         rows.append(row)
 
     summary_path = write_summary(rows, summary_csv)
@@ -316,4 +486,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

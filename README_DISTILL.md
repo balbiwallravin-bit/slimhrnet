@@ -12,7 +12,7 @@ The following scripts were added or updated for the custom SlimHRNet student wor
 - `tools/extract_frames.py`: extract cropped+resized JPEG frames for stable training.
 - `src/datasets/ball_dataset.py`: dataset for distilled training, preferring extracted JPEGs and falling back to videos.
 - `tools/train_distill.py`: multi-GPU distillation training.
-- `tools/test_videos.py`: batch visual test helper for sampled videos plus per-video speed summary.
+- `tools/test_videos.py`: batch video test helper with sequential `cap.read()`, GPU crop/resize, post-rendered `result.mp4`, and per-video speed summary.
 - `benchmark_speed.py`: synthetic preprocessing/model/postprocess latency benchmark.
 - `benchmark_video_pipeline.py`: end-to-end timing benchmark on real videos.
 
@@ -144,15 +144,15 @@ python tools/train_distill.py \
 
 ## Visual Testing On Real Videos
 
-Use `tools/test_videos.py` to:
+`tools/test_videos.py` now uses a faster testing pipeline:
 
-- optionally force-include one specific video
-- randomly sample more videos from a folder
-- run tracking inference
-- save rendered output videos and `traj.csv`
-- write a per-video speed summary CSV
+- sequential `cap.read()` video decoding
+- crop + resize on GPU with `torch` and `torchvision.transforms.functional`
+- no intermediate `result_frames/` dump during inference
+- `traj.csv` is written immediately after tracking
+- `result.mp4` is rendered in a separate post-process pass, so it does not slow the main inference loop
 
-### Example: specific video + 5 random videos from `/home/lht/ceshi`
+### Example: one fixed video + 5 random videos from `/home/lht/ceshi`
 
 ```bash
 CUDA_VISIBLE_DEVICES=4 \
@@ -171,10 +171,11 @@ python tools/test_videos.py \
 
 Notes:
 
-- `--num-random 5` means the forced video plus 5 additional random videos, so up to 6 outputs total.
-- If you want exactly 5 total including the forced video, use `--num-random 4`.
+- `--num-random 5` means the fixed video plus 5 additional random videos, so up to 6 outputs total.
+- If you want exactly 5 total including the fixed video, use `--num-random 4`.
+- Add `--skip-render` when you only want speed and `traj.csv`, without generating `result.mp4`.
 - Outputs are stored under the chosen `--output-dir`.
-- The script also writes `selected_videos.txt` and `summary.csv`.
+- The script writes `selected_videos.txt` and `summary.csv`.
 
 The generated layout looks like this:
 
@@ -186,6 +187,15 @@ video_test_outputs/slimhrnet_check/
     result.mp4
     traj.csv
 ```
+
+### Speed fields in `summary.csv`
+
+- `preprocess_sec`: GPU upload + crop + resize + normalize time accumulated across the video.
+- `inference_sec`: end-to-end inference loop time excluding post-render.
+- `tracking_sec`: tracker-only portion.
+- `render_sec`: optional post-render video generation time.
+- `fps_inference`: effective FPS for the main inference loop.
+- `fps_wall`: effective FPS including post-render when enabled.
 
 ## Speed Benchmarks
 
@@ -259,5 +269,3 @@ print("gt_shape=", tuple(gt_hm.shape))
 print("loss=", float(loss))
 PY
 ```
-
-
