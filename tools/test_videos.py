@@ -1,6 +1,7 @@
 """
-Sample videos from a directory, run tracking inference with sequential video reads,
-optionally render a result video as a post-process step, and write a speed summary CSV.
+Sample videos from a directory, run tracking inference with async sequential video reads,
+optionally skip nearly static frames, optionally render a result video as a post-process
+step, and write a speed summary CSV.
 
 Example:
   python tools/test_videos.py \
@@ -16,8 +17,10 @@ Example:
 import argparse
 import csv
 import os
+import queue
 import random
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -45,8 +48,64 @@ from trackers import build_tracker  # noqa: E402
 VIDEO_EXTENSIONS = [".mp4", ".ts", ".avi", ".mov", ".mkv"]
 CROP_X1, CROP_Y1 = 367, 100
 CROP_X2, CROP_Y2 = 1760, 750
+DIFF_W, DIFF_H = 96, 54
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+
+class AsyncVideoReader:
+    def __init__(self, video_path, queue_size=8):
+        self.video_path = str(video_path)
+        self.queue_size = max(int(queue_size), 1)
+        self.frame_queue = queue.Queue(maxsize=self.queue_size)
+        self.stop_event = threading.Event()
+        self.error = None
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"failed to open video: {self.video_path}")
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _put_with_retry(self, item):
+        while not self.stop_event.is_set():
+            try:
+                self.frame_queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _worker(self):
+        frame_idx = 0
+        try:
+            while not self.stop_event.is_set():
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
+                self._put_with_retry((frame_idx, frame))
+                frame_idx += 1
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.cap.release()
+            self._put_with_retry(None)
+
+    def read(self):
+        item = self.frame_queue.get()
+        if self.error is not None:
+            raise self.error
+        return item
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        try:
+            self.cap.release()
+        except Exception:
+            pass
 
 
 def parse_args():
@@ -64,6 +123,9 @@ def parse_args():
     parser.add_argument("--output-dir", default="video_test_outputs")
     parser.add_argument("--summary-csv", default=None)
     parser.add_argument("--skip-render", action="store_true", help="Skip post-rendered result.mp4 generation.")
+    parser.add_argument("--decode-queue-size", type=int, default=8, help="Frame prefetch queue size for async decoding.")
+    parser.add_argument("--static-diff-threshold", type=float, default=3.0, help="Mean absolute grayscale diff threshold (0-255 scale).")
+    parser.add_argument("--disable-static-skip", action="store_true", help="Disable frame-difference based static-frame skipping.")
     return parser.parse_args()
 
 
@@ -145,15 +207,6 @@ def sync_if_needed(device):
         torch.cuda.synchronize(device)
 
 
-def count_video_frames(video_path):
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return 0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return frame_count
-
-
 def safe_relative(path, root):
     try:
         return path.resolve().relative_to(Path(root).resolve())
@@ -214,6 +267,18 @@ def preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std):
     resized = resized.float() / 255.0
     resized = (resized - mean) / std
     return resized
+
+
+def build_diff_frame(frame_bgr):
+    cropped = frame_bgr[CROP_Y1:CROP_Y2, CROP_X1:CROP_X2]
+    if cropped.size == 0:
+        cropped = frame_bgr
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (DIFF_W, DIFF_H), interpolation=cv2.INTER_AREA)
+
+
+def mean_frame_diff(prev_frame, cur_frame):
+    return float(np.mean(cv2.absdiff(prev_frame, cur_frame)))
 
 
 def write_traj_csv(rows, output_path):
@@ -283,7 +348,17 @@ def render_video_postprocess(video_path, traj_rows, output_path):
     writer.release()
 
 
-def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render):
+def build_result_row(frame_id, result):
+    return {
+        "Frame": frame_id,
+        "X": safe_coord(result.get("x")),
+        "Y": safe_coord(result.get("y")),
+        "Visibility": int(bool(result.get("visi", False))),
+        "Score": round(safe_score(result.get("score")), 6),
+    }
+
+
+def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render, decode_queue_size, static_diff_threshold, disable_static_skip):
     video_path = Path(video_path).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -300,66 +375,97 @@ def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render
     frames_in = int(cfg.model.frames_in)
     affine = build_crop_affine_tensor(cfg)
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"failed to open video: {video_path}")
+    if step != 1 and not disable_static_skip:
+        print(f"[WARN] static-skip is optimized for step=1, but detector.step={step}; disabling it")
+        disable_static_skip = True
 
-    raw_frames_reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    reader = AsyncVideoReader(video_path, queue_size=decode_queue_size).start()
     det_results = defaultdict(list)
     frame_ids_buffer = []
     frame_tensors_buffer = []
+    skipped_static_ids = set()
+    prev_diff_frame = None
+    last_preprocessed = None
     actual_frame_count = 0
     preprocess_sec = 0.0
+    decode_wait_sec = 0.0
+    had_model_output = False
 
     infer_start = time.perf_counter()
-    while True:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            t_wait = time.perf_counter()
+            item = reader.read()
+            decode_wait_sec += time.perf_counter() - t_wait
+            if item is None:
+                break
 
-        sync_if_needed(device)
-        t_pre = time.perf_counter()
-        frame_tensor = preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std)
-        sync_if_needed(device)
-        preprocess_sec += time.perf_counter() - t_pre
+            frame_id, frame_bgr = item
+            actual_frame_count = frame_id + 1
 
-        frame_ids_buffer.append(actual_frame_count)
-        frame_tensors_buffer.append(frame_tensor)
+            diff_frame = build_diff_frame(frame_bgr)
+            static_skip = False
+            if (
+                not disable_static_skip
+                and prev_diff_frame is not None
+                and had_model_output
+                and last_preprocessed is not None
+            ):
+                static_skip = mean_frame_diff(prev_diff_frame, diff_frame) < static_diff_threshold
+            prev_diff_frame = diff_frame
 
-        if len(frame_tensors_buffer) == frames_in:
-            input_tensor = torch.cat(frame_tensors_buffer, dim=0).unsqueeze(0)
-            batch_results, _ = detector.run_tensor(input_tensor, affine)
-            for elem_idx in sorted(batch_results[0].keys()):
-                det_results[frame_ids_buffer[elem_idx]].extend(batch_results[0][elem_idx])
-
-            if step == 1:
-                frame_ids_buffer.pop(0)
-                frame_tensors_buffer.pop(0)
-            elif step == 3:
-                frame_ids_buffer = []
-                frame_tensors_buffer = []
+            if static_skip:
+                frame_tensor = last_preprocessed
             else:
-                cap.release()
-                raise ValueError(f"unsupported detector.step={step}")
+                sync_if_needed(device)
+                t_pre = time.perf_counter()
+                frame_tensor = preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std)
+                sync_if_needed(device)
+                preprocess_sec += time.perf_counter() - t_pre
+                last_preprocessed = frame_tensor
 
-        actual_frame_count += 1
+            frame_ids_buffer.append(frame_id)
+            frame_tensors_buffer.append(frame_tensor)
 
-    cap.release()
+            if len(frame_tensors_buffer) == frames_in:
+                if static_skip and step == 1:
+                    skipped_static_ids.add(frame_id)
+                    frame_ids_buffer.pop(0)
+                    frame_tensors_buffer.pop(0)
+                    continue
+
+                input_tensor = torch.cat(frame_tensors_buffer, dim=0).unsqueeze(0)
+                batch_results, _ = detector.run_tensor(input_tensor, affine)
+                had_model_output = True
+                for elem_idx in sorted(batch_results[0].keys()):
+                    det_results[frame_ids_buffer[elem_idx]].extend(batch_results[0][elem_idx])
+
+                if step == 1:
+                    frame_ids_buffer.pop(0)
+                    frame_tensors_buffer.pop(0)
+                elif step == 3:
+                    frame_ids_buffer = []
+                    frame_tensors_buffer = []
+                else:
+                    raise ValueError(f"unsupported detector.step={step}")
+    finally:
+        reader.close()
 
     tracker.refresh()
     track_start = time.perf_counter()
     traj_rows = []
-    for frame_id in sorted(det_results.keys()):
-        result = tracker.update(det_results[frame_id])
-        traj_rows.append(
-            {
-                "Frame": frame_id,
-                "X": safe_coord(result.get("x")),
-                "Y": safe_coord(result.get("y")),
-                "Visibility": int(bool(result.get("visi", False))),
-                "Score": round(safe_score(result.get("score")), 6),
-            }
-        )
+    last_row = None
+    for frame_id in range(actual_frame_count):
+        if frame_id in det_results:
+            result = tracker.update(det_results[frame_id])
+            row = build_result_row(frame_id, result)
+            traj_rows.append(row)
+            last_row = row
+        elif frame_id in skipped_static_ids and last_row is not None:
+            copied = dict(last_row)
+            copied["Frame"] = frame_id
+            traj_rows.append(copied)
+            last_row = copied
     track_sec = time.perf_counter() - track_start
     inference_sec = time.perf_counter() - infer_start
 
@@ -378,9 +484,11 @@ def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render
         "video": str(video_path),
         "status": "ok",
         "error": "",
-        "raw_frames": actual_frame_count if actual_frame_count > 0 else raw_frames_reported,
-        "unique_frames": actual_frame_count if actual_frame_count > 0 else raw_frames_reported,
+        "raw_frames": actual_frame_count,
+        "unique_frames": actual_frame_count,
         "predicted_frames": predicted_frames,
+        "skipped_static_frames": len(skipped_static_ids),
+        "decode_wait_sec": round(decode_wait_sec, 6),
         "preprocess_sec": round(preprocess_sec, 6),
         "inference_sec": round(inference_sec, 6),
         "tracking_sec": round(track_sec, 6),
@@ -404,6 +512,8 @@ def write_summary(rows, output_csv):
         "raw_frames",
         "unique_frames",
         "predicted_frames",
+        "skipped_static_frames",
+        "decode_wait_sec",
         "preprocess_sec",
         "inference_sec",
         "tracking_sec",
@@ -451,10 +561,14 @@ def main():
                 video_path,
                 video_out_dir,
                 skip_render=args.skip_render,
+                decode_queue_size=args.decode_queue_size,
+                static_diff_threshold=args.static_diff_threshold,
+                disable_static_skip=args.disable_static_skip,
             )
             print(
                 f"[OK] {Path(video_path).name} | "
                 f"predicted_frames={row['predicted_frames']} | "
+                f"skipped_static={row['skipped_static_frames']} | "
                 f"fps_inference={row['fps_inference']:.2f} | "
                 f"fps_wall={row['fps_wall']:.2f}"
             )
@@ -466,6 +580,8 @@ def main():
                 "raw_frames": 0,
                 "unique_frames": 0,
                 "predicted_frames": 0,
+                "skipped_static_frames": 0,
+                "decode_wait_sec": 0.0,
                 "preprocess_sec": 0.0,
                 "inference_sec": 0.0,
                 "tracking_sec": 0.0,

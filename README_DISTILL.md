@@ -12,7 +12,7 @@ The following scripts were added or updated for the custom SlimHRNet student wor
 - `tools/extract_frames.py`: extract cropped+resized JPEG frames for stable training.
 - `src/datasets/ball_dataset.py`: dataset for distilled training, preferring extracted JPEGs and falling back to videos.
 - `tools/train_distill.py`: multi-GPU distillation training.
-- `tools/test_videos.py`: batch video test helper with sequential `cap.read()`, GPU crop/resize, post-rendered `result.mp4`, and per-video speed summary.
+- `tools/test_videos.py`: batch video test helper with async sequential decoding, GPU crop/resize, optional static-frame skipping, post-rendered `result.mp4`, and per-video speed summary.
 - `benchmark_speed.py`: synthetic preprocessing/model/postprocess latency benchmark.
 - `benchmark_video_pipeline.py`: end-to-end timing benchmark on real videos.
 
@@ -146,8 +146,9 @@ python tools/train_distill.py \
 
 `tools/test_videos.py` now uses a faster testing pipeline:
 
-- sequential `cap.read()` video decoding
+- sequential `cap.read()` video decoding through an async prefetch thread
 - crop + resize on GPU with `torch` and `torchvision.transforms.functional`
+- optional frame-difference based static-frame skipping for nearly unchanged frames
 - no intermediate `result_frames/` dump during inference
 - `traj.csv` is written immediately after tracking
 - `result.mp4` is rendered in a separate post-process pass, so it does not slow the main inference loop
@@ -166,6 +167,8 @@ python tools/test_videos.py \
     --include-video /home/lht/ceshi/D1_S20251015112330_E20251015112400.mp4 \
     --num-random 5 \
     --gpus 0 \
+    --decode-queue-size 8 \
+    --static-diff-threshold 3.0 \
     --output-dir video_test_outputs/slimhrnet_check | tee test_videos.log
 ```
 
@@ -174,6 +177,9 @@ Notes:
 - `--num-random 5` means the fixed video plus 5 additional random videos, so up to 6 outputs total.
 - If you want exactly 5 total including the fixed video, use `--num-random 4`.
 - Add `--skip-render` when you only want speed and `traj.csv`, without generating `result.mp4`.
+- Add `--disable-static-skip` if you want to isolate async decode without the static-frame optimization.
+- `--decode-queue-size` controls how many decoded frames are prefetched on CPU while the GPU is busy.
+- `--static-diff-threshold` is the grayscale mean-difference threshold on a 0-255 scale; lower values make the skip logic more conservative.
 - Outputs are stored under the chosen `--output-dir`.
 - The script writes `selected_videos.txt` and `summary.csv`.
 
@@ -190,10 +196,12 @@ video_test_outputs/slimhrnet_check/
 
 ### Speed fields in `summary.csv`
 
+- `decode_wait_sec`: time spent by the main loop waiting for the async decoder queue.
 - `preprocess_sec`: GPU upload + crop + resize + normalize time accumulated across the video.
 - `inference_sec`: end-to-end inference loop time excluding post-render.
 - `tracking_sec`: tracker-only portion.
 - `render_sec`: optional post-render video generation time.
+- `skipped_static_frames`: how many frames reused the previous result instead of running the model.
 - `fps_inference`: effective FPS for the main inference loop.
 - `fps_wall`: effective FPS including post-render when enabled.
 
@@ -269,3 +277,26 @@ print("gt_shape=", tuple(gt_hm.shape))
 print("loss=", float(loss))
 PY
 ```
+
+### Isolating the new optimizations
+
+If you want to measure async decode alone without static-frame skipping, keep the queue but disable the skip path:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONUNBUFFERED=1 \
+OPENCV_FFMPEG_LOGLEVEL=0 \
+AV_LOG_FORCE_NOCOLOR=1 \
+python tools/test_videos.py \
+    --config-name inference_slimhrnet \
+    --model-path checkpoints_balanced/best.pth \
+    --video-dir /home/lht/ceshi \
+    --include-video /home/lht/ceshi/D1_S20251015112330_E20251015112400.mp4 \
+    --num-random 3 \
+    --gpus 0 \
+    --decode-queue-size 8 \
+    --disable-static-skip \
+    --output-dir video_test_outputs/slimhrnet_check_async_only | tee test_videos_async_only.log
+```
+
+For the combined async-decode + static-skip path, remove `--disable-static-skip` and optionally tune `--static-diff-threshold`.
