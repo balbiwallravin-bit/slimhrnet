@@ -16,8 +16,14 @@ from collections import defaultdict
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_csv", default="data/pseudo_labels_clean.csv")
-    parser.add_argument("--output_dir", default="data/splits")
+    parser.add_argument(
+        "--input_csv",
+        default="/home/lht/codexwork/slimhrnet/data_maked/pseudo_labels/clean/pseudo_labels_clean_v2.csv",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="/home/lht/codexwork/slimhrnet/data_maked/splits_v2",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -29,8 +35,11 @@ def main():
     random.seed(args.seed)
 
     video_rows = defaultdict(list)
+    fieldnames = None
     with open(args.input_csv) as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        for row in reader:
             video_rows[row["video_path"]].append(row)
 
     videos = list(video_rows.keys())
@@ -47,7 +56,8 @@ def main():
     }
 
     os.makedirs(args.output_dir, exist_ok=True)
-    fieldnames = ["video_path", "frame_idx", "cx_norm", "cy_norm", "score"]
+    if not fieldnames:
+        raise ValueError(f"no columns found in {args.input_csv}")
 
     for split_name, split_videos in splits.items():
         out_path = os.path.join(args.output_dir, f"{split_name}.csv")

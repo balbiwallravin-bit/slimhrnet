@@ -8,6 +8,10 @@ class GaussianPostprocessor(object):
     def __init__(self, cfg):
         self._score_threshold = cfg["detector"]["postprocessor"]["score_threshold"]
         self._scales = cfg["detector"]["postprocessor"]["scales"]
+        self._decode_method = cfg["detector"]["postprocessor"].get("decode_method", "weighted_peak")
+        self._soft_argmax_beta = float(
+            cfg["detector"]["postprocessor"].get("soft_argmax_beta", 100.0)
+        )
 
     def _decode_single(self, hm):
         score = hm.max().item()
@@ -16,15 +20,19 @@ class GaussianPostprocessor(object):
 
         h, w = hm.shape
         device = hm.device
-        weights = hm * (hm >= self._score_threshold)
-        if weights.sum().item() <= 0:
-            weights = hm
 
         gy, gx = torch.meshgrid(
             torch.arange(h, dtype=hm.dtype, device=device),
             torch.arange(w, dtype=hm.dtype, device=device),
             indexing="ij",
         )
+        if self._decode_method == "soft_argmax":
+            weights = torch.softmax(hm.reshape(-1) * self._soft_argmax_beta, dim=0).view(h, w)
+        else:
+            weights = hm * (hm >= self._score_threshold)
+            if weights.sum().item() <= 0:
+                weights = hm
+
         total = weights.sum() + 1e-6
         cx = (weights * gx).sum() / total
         cy = (weights * gy).sum() / total

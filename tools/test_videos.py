@@ -43,11 +43,10 @@ if str(SRC_DIR) not in sys.path:
 
 from detectors import build_detector  # noqa: E402
 from trackers import build_tracker  # noqa: E402
+from utils.resize_ops import build_affine_from_resize_plan, build_resize_plan  # noqa: E402
 
 
 VIDEO_EXTENSIONS = [".mp4", ".ts", ".avi", ".mov", ".mkv"]
-CROP_X1, CROP_Y1 = 367, 100
-CROP_X2, CROP_Y2 = 1760, 750
 DIFF_W, DIFF_H = 96, 54
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
@@ -226,20 +225,15 @@ def safe_score(value):
     return float(value)
 
 
-def build_crop_affine_tensor(cfg):
-    inp_w = int(cfg.model.inp_width)
-    inp_h = int(cfg.model.inp_height)
-    crop_w = CROP_X2 - CROP_X1
-    crop_h = CROP_Y2 - CROP_Y1
-    sx = (crop_w - 1) / max(inp_w - 1, 1)
-    sy = (crop_h - 1) / max(inp_h - 1, 1)
-    trans_single = np.array(
-        [
-            [sx, 0.0, float(CROP_X1)],
-            [0.0, sy, float(CROP_Y1)],
-        ],
-        dtype=np.float32,
+def build_resize_affine_tensor(cfg, frame_w, frame_h):
+    plan = build_resize_plan(
+        frame_w,
+        frame_h,
+        dst_w=int(cfg.model.inp_width),
+        dst_h=int(cfg.model.inp_height),
+        mode="stretch",
     )
+    trans_single = build_affine_from_resize_plan(plan, dtype=np.float32)
     trans = np.stack([trans_single for _ in range(int(cfg.model.frames_out))], axis=0)
     return torch.tensor(trans, dtype=torch.float32).unsqueeze(0)
 
@@ -250,14 +244,7 @@ def preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std):
         raw_cpu = raw_cpu.pin_memory()
     raw_gpu = raw_cpu.to(device, non_blocking=(device.type == "cuda"))
 
-    _, height, width = raw_gpu.shape
-    x1 = max(0, min(CROP_X1, width - 1))
-    x2 = max(x1 + 1, min(CROP_X2, width))
-    y1 = max(0, min(CROP_Y1, height - 1))
-    y2 = max(y1 + 1, min(CROP_Y2, height))
-
-    cropped = raw_gpu[:, y1:y2, x1:x2]
-    rgb = cropped[[2, 1, 0], ...]
+    rgb = raw_gpu[[2, 1, 0], ...]
     resized = TF.resize(
         rgb,
         [input_h, input_w],
@@ -270,10 +257,7 @@ def preprocess_frame_gpu(frame_bgr, device, input_h, input_w, mean, std):
 
 
 def build_diff_frame(frame_bgr):
-    cropped = frame_bgr[CROP_Y1:CROP_Y2, CROP_X1:CROP_X2]
-    if cropped.size == 0:
-        cropped = frame_bgr
-    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.resize(gray, (DIFF_W, DIFF_H), interpolation=cv2.INTER_AREA)
 
 
@@ -284,7 +268,7 @@ def mean_frame_diff(prev_frame, cur_frame):
 def write_traj_csv(rows, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["Frame", "X", "Y", "Visibility", "Score"]
+    fieldnames = ["Frame", "X", "Y", "Visibility", "Score", "Status"]
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -355,6 +339,7 @@ def build_result_row(frame_id, result):
         "Y": safe_coord(result.get("y")),
         "Visibility": int(bool(result.get("visi", False))),
         "Score": round(safe_score(result.get("score")), 6),
+        "Status": result.get("status", ""),
     }
 
 
@@ -373,7 +358,13 @@ def run_single_video(cfg, detector, tracker, video_path, output_dir, skip_render
     input_w = int(cfg.model.inp_width)
     step = int(cfg.detector.step)
     frames_in = int(cfg.model.frames_in)
-    affine = build_crop_affine_tensor(cfg)
+    probe_cap = cv2.VideoCapture(str(video_path))
+    if not probe_cap.isOpened():
+        raise RuntimeError(f"failed to open video: {video_path}")
+    frame_w = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe_cap.release()
+    affine = build_resize_affine_tensor(cfg, frame_w, frame_h)
 
     if step != 1 and not disable_static_skip:
         print(f"[WARN] static-skip is optimized for step=1, but detector.step={step}; disabling it")

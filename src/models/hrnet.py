@@ -305,6 +305,8 @@ class HRNet(nn.Module):
         self._stem_strides  = cfg['MODEL']['EXTRA']['STEM']['STRIDES']
         self._stem_inplanes = cfg['MODEL']['EXTRA']['STEM']['INPLANES']
         self._use_se = cfg.get('use_se', cfg['MODEL']['EXTRA'].get('USE_SE', False))
+        self._aux_heads_cfg = cfg.get('aux_heads', {})
+        self._enable_aux_heads = bool(self._aux_heads_cfg.get('enabled', False))
 
         self.conv1 = nn.Conv2d(3*self._frames_in, self._stem_inplanes, kernel_size=3, stride=self._stem_strides[0], padding=1, bias=False)
         self.bn1   = nn.BatchNorm2d(self._stem_inplanes, momentum=BN_MOMENTUM)
@@ -365,6 +367,10 @@ class HRNet(nn.Module):
 
         self.deconv_layers = self._make_deconv_layers(cfg, pre_stage_channels[0])
         self.final_layers  = self._make_final_layers(cfg, pre_stage_channels)
+        if self._enable_aux_heads:
+            aux_in_channels = pre_stage_channels[0]
+            self.angle_head = nn.Conv2d(aux_in_channels, 2, kernel_size=1)
+            self.length_head = nn.Conv2d(aux_in_channels, 1, kernel_size=1)
 
     def _get_deconv_cfg(self, deconv_kernel):
         if deconv_kernel == 4:
@@ -545,12 +551,18 @@ class HRNet(nn.Module):
         y_list = self.stage4(x_list)
 
         y_out = {}
+        aux_feature = None
         for scale in self._out_scales:
             x = y_list[scale]
             for i in range(self.num_deconvs):
                 x = self.deconv_layers[i][scale](x)
             y = self.final_layers[scale](x)
             y_out[scale] = y
+            if self._enable_aux_heads and scale == 0:
+                aux_feature = x
+        if self._enable_aux_heads and aux_feature is not None:
+            y_out['angle'] = self.angle_head(aux_feature)
+            y_out['length'] = self.length_head(aux_feature)
         return y_out
 
     def init_weights(self, pretrained='',):

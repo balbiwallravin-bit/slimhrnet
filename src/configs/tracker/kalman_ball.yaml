@@ -1,0 +1,6 @@
+name: kalman_ball
+dt: 0.0166666667
+max_miss: 8
+gate_radius: 80
+score_high: 0.5
+score_low: 0.2

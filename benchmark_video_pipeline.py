@@ -23,8 +23,8 @@ if str(SRC_DIR) not in sys.path:
 from detectors import build_detector  # noqa: E402
 from models import build_model  # noqa: E402
 from trackers import build_tracker  # noqa: E402
-from utils.image import get_affine_transform  # noqa: E402
 from utils.preprocess import process_video  # noqa: E402
+from utils.resize_ops import build_affine_from_resize_plan, build_resize_plan  # noqa: E402
 
 
 def parse_args():
@@ -236,19 +236,16 @@ def build_affine_tensor(cfg, video_path):
     raw_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    center = np.array([width / 2.0, height / 2.0], dtype=np.float32)
-    scale = max(height, width) * 1.0
+    plan = build_resize_plan(
+        width,
+        height,
+        dst_w=cfg.model.inp_width,
+        dst_h=cfg.model.inp_height,
+        mode="stretch",
+    )
+    affine_single = build_affine_from_resize_plan(plan, dtype=np.float32)
     trans = np.stack(
-        [
-            get_affine_transform(
-                center,
-                scale,
-                0,
-                [cfg.model.inp_width, cfg.model.inp_height],
-                inv=1,
-            )
-            for _ in range(cfg.model.frames_out)
-        ],
+        [affine_single for _ in range(cfg.model.frames_out)],
         axis=0,
     )
     return torch.tensor(trans)[None, :], raw_frames

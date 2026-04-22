@@ -19,7 +19,7 @@ if str(SRC_DIR) not in sys.path:
 from detectors.blurball_postprocessor import BlurBallPostprocessor  # noqa: E402
 from detectors.gaussian_postprocessor import GaussianPostprocessor  # noqa: E402
 from models import build_model  # noqa: E402
-from utils.image import get_affine_transform  # noqa: E402
+from utils.resize_ops import build_affine_from_resize_plan, build_resize_plan  # noqa: E402
 
 
 def parse_args():
@@ -120,21 +120,16 @@ def to_postprocess_dtype(preds):
 
 def build_dummy_pipeline_inputs(args, cfg, dtype, device):
     del dtype
-    center = np.array(
-        [args.input_orig_w / 2.0, args.input_orig_h / 2.0], dtype=np.float32
+    plan = build_resize_plan(
+        args.input_orig_w,
+        args.input_orig_h,
+        dst_w=cfg.model.inp_width,
+        dst_h=cfg.model.inp_height,
+        mode="stretch",
     )
-    scale = max(args.input_orig_h, args.input_orig_w) * 1.0
+    affine_single = build_affine_from_resize_plan(plan, dtype=np.float32)
     affine_mats = np.stack(
-        [
-            get_affine_transform(
-                center,
-                scale,
-                0,
-                [cfg.model.inp_width, cfg.model.inp_height],
-                inv=1,
-            )
-            for _ in range(cfg.model.frames_out)
-        ],
+        [affine_single for _ in range(cfg.model.frames_out)],
         axis=0,
     )
     affine_mats = torch.tensor(affine_mats, dtype=torch.float32, device=device).unsqueeze(0)

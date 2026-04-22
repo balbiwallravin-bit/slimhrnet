@@ -15,6 +15,24 @@ The following scripts were added or updated for the custom SlimHRNet student wor
 - `tools/test_videos.py`: batch video test helper with async sequential decoding, GPU crop/resize, optional static-frame skipping, post-rendered `result.mp4`, and per-video speed summary.
 - `benchmark_speed.py`: synthetic preprocessing/model/postprocess latency benchmark.
 - `benchmark_video_pipeline.py`: end-to-end timing benchmark on real videos.
+- `tools/profile_inference.py`: day-1 inference profiling helper for FP32 / FP16 / channels_last / torch.compile.
+
+## Current V2 Retrain Status
+
+The repository now contains the first-pass implementation for the new retraining plan:
+
+- pseudo labels can store `x_model`, `y_model`, `score`, `angle_deg`, `length_input_px`, `length_px`
+- label cleaning is now segment-based, with low-score breaking, velocity-residual splitting, and optional interpolation
+- the student dataset can consume interpolated weights and auxiliary blur labels
+- a `slimhrnet_v2` config is available with widened high-resolution branches and optional angle/length heads
+- `gaussian_postprocessor.py` supports soft-argmax decoding
+- a `kalman_ball` tracker config is available for the new inference path
+
+What is still intentionally not automated in-repo:
+
+- manual suspicious-segment screening UI
+- TensorRT engine export / runtime wrapper
+- GT labeling workflow
 
 ## Why The Frame Extraction Step Exists
 
@@ -33,7 +51,8 @@ Assumed paths used below:
 - repo: `/home/lht/codexwork/slimhrnet`
 - teacher weights: `/home/lht/codexwork/blurball-mainyy/blurball_best.pth`
 - raw videos: `/home/lht/daqiu`
-- extracted JPEGs: `/home/lht/daqiu_frames`
+- generated workspace: `/home/lht/codexwork/slimhrnet/data_maked`
+- extracted JPEGs: `/home/lht/codexwork/slimhrnet/data_maked/frames`
 
 Activate the environment first:
 
@@ -52,31 +71,34 @@ AV_LOG_FORCE_NOCOLOR=1 \
 python tools/auto_label.py \
     --video_root /home/lht/daqiu \
     --weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
-    --output_csv data/pseudo_labels_raw.csv \
-    --step 3 \
-    --score_threshold 0.4 \
+    --output_csv /home/lht/codexwork/slimhrnet/data_maked/pseudo_labels/raw/pseudo_labels_raw.csv \
+    --step 1 \
+    --resize_mode stretch \
+    --score_threshold 0.5 \
     --device cuda | tee auto_label.log
 ```
 
 ### 2. Clean the pseudo labels
 
-Balanced cleaning settings used in practice:
+Segment-based cleaning settings used in practice:
 
 ```bash
 python tools/clean_labels.py \
-    --input_csv data/pseudo_labels_raw.csv \
-    --output_csv data/pseudo_labels_clean_balanced.csv \
+    --input_csv /home/lht/codexwork/slimhrnet/data_maked/pseudo_labels/raw/pseudo_labels_raw.csv \
+    --output_csv /home/lht/codexwork/slimhrnet/data_maked/pseudo_labels/clean/pseudo_labels_clean_v2.csv \
     --min_score 0.50 \
-    --max_jump 0.18 \
-    --min_coverage 0.02 | tee clean_labels_balanced.log
+    --max_residual_px 150 \
+    --min_segment_frames 30 \
+    --max_segment_frames 480 \
+    --interp_max_gap 2 | tee clean_labels_v2.log
 ```
 
 ### 3. Split train / val / test by video
 
 ```bash
 python tools/split_dataset.py \
-    --input_csv data/pseudo_labels_clean_balanced.csv \
-    --output_dir data/splits_balanced | tee split_dataset_balanced.log
+    --input_csv /home/lht/codexwork/slimhrnet/data_maked/pseudo_labels/clean/pseudo_labels_clean_v2.csv \
+    --output_dir /home/lht/codexwork/slimhrnet/data_maked/splits_v2 | tee split_dataset_v2.log
 ```
 
 ### 4. Extract cropped JPEG frames
@@ -87,8 +109,9 @@ OPENCV_FFMPEG_LOGLEVEL=0 \
 AV_LOG_FORCE_NOCOLOR=1 \
 python tools/extract_frames.py \
     --video_root /home/lht/daqiu \
-    --output_root /home/lht/daqiu_frames \
-    --step 3 | tee extract_frames.log
+    --output_root /home/lht/codexwork/slimhrnet/data_maked/frames \
+    --step 1 \
+    --resize_mode stretch | tee extract_frames.log
 ```
 
 ### 5. Train the student with distillation
@@ -101,12 +124,13 @@ PYTHONUNBUFFERED=1 \
 OPENCV_FFMPEG_LOGLEVEL=0 \
 AV_LOG_FORCE_NOCOLOR=1 \
 python tools/train_distill.py \
-    --train_csv data/splits_balanced/train.csv \
-    --val_csv data/splits_balanced/val.csv \
+    --train_csv /home/lht/codexwork/slimhrnet/data_maked/splits_v2/train.csv \
+    --val_csv /home/lht/codexwork/slimhrnet/data_maked/splits_v2/val.csv \
     --teacher_weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
-    --save_dir checkpoints_balanced \
+    --student_config inference_slimhrnet_v2 \
+    --save_dir /home/lht/codexwork/slimhrnet/data_maked/checkpoints_v2 \
     --video_root /home/lht/daqiu \
-    --frame_root /home/lht/daqiu_frames \
+    --frame_root /home/lht/codexwork/slimhrnet/data_maked/frames \
     --epochs 80 \
     --batch_size 24 \
     --lr 1e-3 \
@@ -114,6 +138,9 @@ python tools/train_distill.py \
     --alpha 0.7 \
     --beta 0.3 \
     --sigma 3.0 \
+    --dynamic_sigma \
+    --ohem_ratio 0.3 \
+    --ohem_start_epoch 40 \
     --device cuda | tee train_distill_balanced.log
 ```
 
@@ -125,12 +152,13 @@ PYTHONUNBUFFERED=1 \
 OPENCV_FFMPEG_LOGLEVEL=0 \
 AV_LOG_FORCE_NOCOLOR=1 \
 python tools/train_distill.py \
-    --train_csv data/splits_balanced/train.csv \
-    --val_csv data/splits_balanced/val.csv \
+    --train_csv /home/lht/codexwork/slimhrnet/data_maked/splits_v2/train.csv \
+    --val_csv /home/lht/codexwork/slimhrnet/data_maked/splits_v2/val.csv \
     --teacher_weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
-    --save_dir checkpoints_balanced \
+    --student_config inference_slimhrnet_v2 \
+    --save_dir /home/lht/codexwork/slimhrnet/data_maked/checkpoints_v2 \
     --video_root /home/lht/daqiu \
-    --frame_root /home/lht/daqiu_frames \
+    --frame_root /home/lht/codexwork/slimhrnet/data_maked/frames \
     --epochs 80 \
     --batch_size 24 \
     --lr 1e-3 \
@@ -138,8 +166,21 @@ python tools/train_distill.py \
     --alpha 0.7 \
     --beta 0.3 \
     --sigma 3.0 \
+    --dynamic_sigma \
+    --ohem_ratio 0.3 \
+    --ohem_start_epoch 40 \
     --device cuda \
-    --resume checkpoints_balanced/latest.pth | tee train_distill_balanced_resume.log
+    --resume /home/lht/codexwork/slimhrnet/data_maked/checkpoints_v2/latest.pth | tee train_distill_v2_resume.log
+```
+
+## Day-1 Speed Profiling
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python tools/profile_inference.py \
+    --config-name inference_slimhrnet_v2 \
+    --weights /home/lht/codexwork/slimhrnet/data_maked/checkpoints_v2/best.pth \
+    --do-profiler
 ```
 
 ## Visual Testing On Real Videos

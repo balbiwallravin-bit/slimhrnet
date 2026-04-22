@@ -1,11 +1,13 @@
 from .intra_frame_peak import IntraFramePeakTracker
 from .online import OnlineTracker
 from .online_blur import OnlineTrackerBlur
+from .kalman_ball import KalmanBallTracker
 
 __tracker_factory = {
     "intra_frame_peak": IntraFramePeakTracker,
     "online": OnlineTracker,
     "online_blur": OnlineTrackerBlur,
+    "kalman_ball": KalmanBallTracker,
 }
 
 

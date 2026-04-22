@@ -1,18 +1,17 @@
-﻿"""
+"""
 Distillation training for SlimHRNet using a BlurBall teacher.
 
-Example:
-  python tools/train_distill.py \
-      --train_csv data/splits/train.csv \
-      --val_csv data/splits/val.csv \
-      --teacher_weights /home/lht/codexwork/blurball-mainyy/blurball_best.pth \
-      --save_dir checkpoints \
-      --epochs 80 \
-      --device cuda
+This version upgrades the original training loop with:
+- direct teacher heatmap KD
+- focal heatmap loss
+- optional OHEM
+- optional angle/length auxiliary supervision
+- dynamic sigma and interpolated-label weights through BallDataset
 """
 
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -44,22 +43,46 @@ FRAMES_IN = 3
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_csv", default="data/splits/train.csv")
-    parser.add_argument("--val_csv", default="data/splits/val.csv")
+    parser.add_argument(
+        "--train_csv",
+        default="/home/lht/codexwork/slimhrnet/data_maked/splits_v2/train.csv",
+    )
+    parser.add_argument(
+        "--val_csv",
+        default="/home/lht/codexwork/slimhrnet/data_maked/splits_v2/val.csv",
+    )
     parser.add_argument(
         "--teacher_weights",
         default="/home/lht/codexwork/blurball-mainyy/blurball_best.pth",
     )
-    parser.add_argument("--save_dir", default="checkpoints")
+    parser.add_argument("--teacher_config", default="inference_blurball")
+    parser.add_argument("--student_config", default="inference_slimhrnet_v2")
+    parser.add_argument(
+        "--save_dir",
+        default="/home/lht/codexwork/slimhrnet/data_maked/checkpoints_v2",
+    )
     parser.add_argument("--video_root", default="/home/lht/daqiu")
-    parser.add_argument("--frame_root", default=None)
+    parser.add_argument(
+        "--frame_root",
+        default="/home/lht/codexwork/slimhrnet/data_maked/frames",
+    )
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--alpha", type=float, default=0.7, help="Teacher soft-target weight.")
-    parser.add_argument("--beta", type=float, default=0.3, help="Pseudo-GT target weight.")
+    parser.add_argument("--alpha", type=float, default=0.7, help="Teacher KD weight.")
+    parser.add_argument("--beta", type=float, default=0.3, help="Pseudo-GT heatmap weight.")
     parser.add_argument("--sigma", type=float, default=3.0)
+    parser.add_argument("--dynamic_sigma", action="store_true")
+    parser.add_argument("--min_sigma", type=float, default=2.0)
+    parser.add_argument("--max_sigma", type=float, default=5.0)
+    parser.add_argument("--length_norm_max", type=float, default=64.0)
+    parser.add_argument("--heatmap_loss", default="focal", choices=["focal", "mse"])
+    parser.add_argument("--angle_weight", type=float, default=0.3)
+    parser.add_argument("--length_weight", type=float, default=0.2)
+    parser.add_argument("--disable_aux", action="store_true")
+    parser.add_argument("--ohem_ratio", type=float, default=0.3)
+    parser.add_argument("--ohem_start_epoch", type=int, default=40)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", default=None, help="Resume from a checkpoint.")
     return parser.parse_args()
@@ -79,6 +102,12 @@ def extract_heatmap_tensor(preds):
             raise KeyError("Model output does not contain scale=0")
         return preds[0]
     return preds
+
+
+def extract_aux_tensor(preds, key):
+    if isinstance(preds, dict):
+        return preds.get(key)
+    return None
 
 
 def unwrap_model(model):
@@ -118,8 +147,8 @@ def load_runtime_config(config_name, device):
     return cfg
 
 
-def load_teacher(weights_path, device):
-    cfg = load_runtime_config("inference_blurball", device)
+def load_teacher(weights_path, device, config_name):
+    cfg = load_runtime_config(config_name, device)
     teacher = build_model(cfg)
 
     state = torch.load(weights_path, map_location="cpu")
@@ -131,63 +160,81 @@ def load_teacher(weights_path, device):
     return teacher
 
 
-def load_student(device):
-    cfg = load_runtime_config("inference_slimhrnet", device)
+def load_student(device, config_name):
+    cfg = load_runtime_config(config_name, device)
     student = build_model(cfg)
     student = student.to(device)
     total_params = sum(param.numel() for param in student.parameters())
-    print(f"[INFO] Loaded SlimHRNet student with {total_params / 1e6:.2f}M params")
+    print(f"[INFO] Loaded student with {total_params / 1e6:.2f}M params from {config_name}")
     return student
 
 
-def teacher_soft_label(teacher, inp, sigma=3.0):
+def teacher_soft_label(teacher, inp):
     with torch.no_grad():
         hm_teacher = extract_heatmap_tensor(teacher(inp))[:, :FRAMES_IN]
-        hm_sig = torch.sigmoid(hm_teacher)
-
-    batch_size, channels, height, width = hm_sig.shape
-    device = hm_sig.device
-    grid_y, grid_x = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32, device=device),
-        torch.arange(width, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-
-    soft_labels = torch.zeros_like(hm_sig)
-    for batch_index in range(batch_size):
-        for channel_index in range(channels):
-            hm = hm_sig[batch_index, channel_index]
-            if hm.max().item() < 0.3:
-                continue
-
-            weights = hm * (hm >= 0.3)
-            if weights.sum().item() <= 0:
-                weights = hm
-
-            total = weights.sum() + 1e-6
-            cx = (weights * grid_x).sum() / total
-            cy = (weights * grid_y).sum() / total
-            dist2 = (grid_x - cx) ** 2 + (grid_y - cy) ** 2
-            soft_labels[batch_index, channel_index] = torch.exp(-dist2 / (2.0 * sigma ** 2))
-
-    return soft_labels
+    return torch.sigmoid(hm_teacher)
 
 
-def distill_loss(pred_raw, soft_label, gt_label, alpha, beta):
+def focal_heatmap_loss_per_sample(pred_raw, target, alpha=2.0, beta=4.0):
+    pred = torch.sigmoid(pred_raw).clamp(1e-7, 1.0 - 1e-7)
+    pos_mask = (target >= 0.999).float()
+    neg_mask = (target < 0.999).float()
+    neg_weights = (1.0 - target) ** beta
+
+    pos_loss = -torch.log(pred) * ((1.0 - pred) ** alpha) * pos_mask
+    neg_loss = -torch.log(1.0 - pred) * (pred ** alpha) * neg_weights * neg_mask
+
+    pos_loss = pos_loss.flatten(1).sum(dim=1)
+    neg_loss = neg_loss.flatten(1).sum(dim=1)
+    num_pos = pos_mask.flatten(1).sum(dim=1)
+    return torch.where(num_pos > 0, (pos_loss + neg_loss) / num_pos.clamp_min(1.0), neg_loss)
+
+
+def mse_loss_per_sample(pred_raw, target):
     pred = torch.sigmoid(pred_raw)
-    loss_soft = F.mse_loss(pred, soft_label)
-    loss_gt = F.mse_loss(pred, gt_label)
-    return alpha * loss_soft + beta * loss_gt
+    return F.mse_loss(pred, target, reduction="none").flatten(1).mean(dim=1)
 
 
-def filter_valid_batch(inp, gt_hm):
-    valid_mask = inp.abs().sum(dim=(1, 2, 3)) > 1.0
-    if valid_mask.sum().item() == 0:
-        return None, None, 0
-    return inp[valid_mask], gt_hm[valid_mask], int(valid_mask.sum().item())
+def kd_loss_per_sample(pred_raw, teacher_label):
+    pred = torch.sigmoid(pred_raw)
+    return F.mse_loss(pred, teacher_label, reduction="none").flatten(1).mean(dim=1)
 
 
-def evaluate(student, val_loader, device):
+def masked_aux_loss_per_sample(pred_aux, target_aux, mask, aux_valid):
+    if pred_aux is None:
+        return torch.zeros_like(aux_valid)
+    weight = mask.expand_as(pred_aux)
+    numer = ((pred_aux - target_aux) ** 2 * weight).flatten(1).sum(dim=1)
+    denom = weight.flatten(1).sum(dim=1).clamp_min(1e-6)
+    return (numer / denom) * aux_valid
+
+
+def decode_soft_argmax_xy(heatmap, beta=100.0):
+    batch, _, height, width = heatmap.shape
+    scores = heatmap.amax(dim=(1, 2, 3))
+    weights = torch.softmax(heatmap.view(batch, -1) * beta, dim=1).view(batch, 1, height, width)
+    ys = torch.arange(height, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, height, 1)
+    xs = torch.arange(width, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, 1, width)
+    x = (weights * xs).sum(dim=(1, 2, 3))
+    y = (weights * ys).sum(dim=(1, 2, 3))
+    return x, y, scores
+
+
+def select_loss_per_sample(pred_raw, gt_hm, heatmap_loss):
+    if heatmap_loss == "focal":
+        return focal_heatmap_loss_per_sample(pred_raw, gt_hm)
+    return mse_loss_per_sample(pred_raw, gt_hm)
+
+
+def apply_ohem(loss_per_sample, ratio, enabled):
+    if not enabled or ratio >= 1.0:
+        return loss_per_sample.mean()
+    k = max(1, int(math.ceil(loss_per_sample.shape[0] * ratio)))
+    hard_losses, _ = torch.topk(loss_per_sample, k)
+    return hard_losses.mean()
+
+
+def evaluate(student, val_loader, device, args):
     student.eval()
     total_loss = 0.0
     total_err = 0.0
@@ -195,47 +242,40 @@ def evaluate(student, val_loader, device):
     valid_batches = 0
 
     with torch.no_grad():
-        for inp, gt_hm in val_loader:
+        for inp, target in val_loader:
             inp = inp.to(device, non_blocking=(device.type == "cuda"))
-            gt_hm = gt_hm.to(device, non_blocking=(device.type == "cuda"))
-            inp, gt_hm, kept = filter_valid_batch(inp, gt_hm)
-            if kept == 0:
-                continue
+            gt_hm = target["heatmap"].to(device, non_blocking=(device.type == "cuda"))
+            angle_t = target["angle"].to(device, non_blocking=(device.type == "cuda"))
+            length_t = target["length"].to(device, non_blocking=(device.type == "cuda"))
+            mask = target["mask"].to(device, non_blocking=(device.type == "cuda"))
+            sample_weight = target["sample_weight"].to(device, non_blocking=(device.type == "cuda"))
+            aux_valid = target["aux_valid"].to(device, non_blocking=(device.type == "cuda"))
 
-            pred_raw = extract_heatmap_tensor(student(inp))[:, :FRAMES_IN]
-            pred_hm = torch.sigmoid(pred_raw)
+            preds = student(inp)
+            pred_raw = extract_heatmap_tensor(preds)[:, :FRAMES_IN]
+            angle_pred = extract_aux_tensor(preds, "angle")
+            length_pred = extract_aux_tensor(preds, "length")
 
-            loss = F.mse_loss(pred_hm, gt_hm)
-            total_loss += loss.item()
+            gt_loss = select_loss_per_sample(pred_raw, gt_hm, args.heatmap_loss)
+            angle_loss = masked_aux_loss_per_sample(angle_pred, angle_t, mask, aux_valid)
+            length_loss = masked_aux_loss_per_sample(length_pred, length_t, mask, aux_valid)
+            loss = gt_loss * sample_weight
+            if not args.disable_aux:
+                loss = loss + args.angle_weight * angle_loss * sample_weight
+                loss = loss + args.length_weight * length_loss * sample_weight
+
+            total_loss += loss.mean().item()
             valid_batches += 1
 
-            _, _, height, width = pred_hm.shape
-            grid_y, grid_x = torch.meshgrid(
-                torch.arange(height, dtype=torch.float32, device=device),
-                torch.arange(width, dtype=torch.float32, device=device),
-                indexing="ij",
-            )
-            for batch_index in range(pred_hm.shape[0]):
-                pred_current = pred_hm[batch_index, -1]
-                gt_current = gt_hm[batch_index, -1]
-                if pred_current.max().item() < 0.3:
-                    continue
-                if gt_current.sum().item() <= 0:
-                    continue
-
-                pred_weights = pred_current * (pred_current >= 0.3)
-                if pred_weights.sum().item() <= 0:
-                    pred_weights = pred_current
-
-                pred_total = pred_weights.sum() + 1e-6
-                gt_total = gt_current.sum() + 1e-6
-                pred_x = (pred_weights * grid_x).sum() / pred_total
-                pred_y = (pred_weights * grid_y).sum() / pred_total
-                gt_x = (gt_current * grid_x).sum() / gt_total
-                gt_y = (gt_current * grid_y).sum() / gt_total
-                err = ((pred_x - gt_x) ** 2 + (pred_y - gt_y) ** 2).sqrt().item()
-                total_err += err
-                count += 1
+            pred_current = torch.sigmoid(pred_raw[:, -1:, ...])
+            gt_current = gt_hm[:, -1:, ...]
+            pred_x, pred_y, scores = decode_soft_argmax_xy(pred_current)
+            gt_x, gt_y, _ = decode_soft_argmax_xy(gt_current)
+            valid = scores >= 0.3
+            if valid.any():
+                err = ((pred_x[valid] - gt_x[valid]) ** 2 + (pred_y[valid] - gt_y[valid]) ** 2).sqrt()
+                total_err += err.sum().item()
+                count += int(valid.sum().item())
 
     mean_loss = total_loss / max(valid_batches, 1)
     mean_err = total_err / max(count, 1)
@@ -245,6 +285,7 @@ def evaluate(student, val_loader, device):
 def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = device.type == "cuda"
     os.makedirs(args.save_dir, exist_ok=True)
 
     gpu_ids = get_visible_gpu_ids(device)
@@ -254,20 +295,17 @@ def main():
             "some GPUs may stay idle"
         )
 
-    train_ds = BallDataset(
-        args.train_csv,
-        augment=True,
-        sigma=args.sigma,
-        video_root=args.video_root,
-        frame_root=args.frame_root,
-    )
-    val_ds = BallDataset(
-        args.val_csv,
-        augment=False,
-        sigma=args.sigma,
-        video_root=args.video_root,
-        frame_root=args.frame_root,
-    )
+    dataset_kwargs = {
+        "sigma": args.sigma,
+        "video_root": args.video_root,
+        "frame_root": args.frame_root,
+        "dynamic_sigma": args.dynamic_sigma,
+        "min_sigma": args.min_sigma,
+        "max_sigma": args.max_sigma,
+        "length_norm_max": args.length_norm_max,
+    }
+    train_ds = BallDataset(args.train_csv, augment=True, **dataset_kwargs)
+    val_ds = BallDataset(args.val_csv, augment=False, **dataset_kwargs)
 
     if len(train_ds) == 0:
         raise ValueError(f"Training dataset is empty: {args.train_csv}")
@@ -293,8 +331,8 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
-    teacher = load_teacher(args.teacher_weights, device)
-    student = load_student(device)
+    teacher = load_teacher(args.teacher_weights, device, args.teacher_config)
+    student = load_student(device, args.student_config)
 
     start_epoch = 0
     best_val_loss = float("inf")
@@ -323,9 +361,16 @@ def main():
             scheduler.load_state_dict(ckpt["scheduler"])
 
     log_path = os.path.join(args.save_dir, "train_log.csv")
-    log_fields = ["epoch", "train_loss", "val_loss", "val_err_hm_px", "lr", "time_min"]
+    log_fields = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "val_err_hm_px",
+        "lr",
+        "time_min",
+    ]
     if start_epoch == 0:
-        with open(log_path, "w", newline="") as f:
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
     for epoch in range(start_epoch, args.epochs):
@@ -333,19 +378,34 @@ def main():
         t0 = time.time()
         total_train_loss = 0.0
         valid_train_batches = 0
-        skipped_train_batches = 0
 
-        for batch_index, (inp, gt_hm) in enumerate(train_loader):
+        for batch_index, (inp, target) in enumerate(train_loader):
             inp = inp.to(device, non_blocking=pin_memory)
-            gt_hm = gt_hm.to(device, non_blocking=pin_memory)
-            inp, gt_hm, kept = filter_valid_batch(inp, gt_hm)
-            if kept == 0:
-                skipped_train_batches += 1
-                continue
+            gt_hm = target["heatmap"].to(device, non_blocking=pin_memory)
+            angle_t = target["angle"].to(device, non_blocking=pin_memory)
+            length_t = target["length"].to(device, non_blocking=pin_memory)
+            mask = target["mask"].to(device, non_blocking=pin_memory)
+            sample_weight = target["sample_weight"].to(device, non_blocking=pin_memory)
+            aux_valid = target["aux_valid"].to(device, non_blocking=pin_memory)
 
-            soft_lbl = teacher_soft_label(teacher, inp, sigma=args.sigma)
-            pred_raw = extract_heatmap_tensor(student(inp))[:, :FRAMES_IN]
-            loss = distill_loss(pred_raw, soft_lbl, gt_hm, args.alpha, args.beta)
+            teacher_lbl = teacher_soft_label(teacher, inp)
+            preds = student(inp)
+            pred_raw = extract_heatmap_tensor(preds)[:, :FRAMES_IN]
+            angle_pred = extract_aux_tensor(preds, "angle")
+            length_pred = extract_aux_tensor(preds, "length")
+
+            kd_loss = kd_loss_per_sample(pred_raw, teacher_lbl)
+            gt_loss = select_loss_per_sample(pred_raw, gt_hm, args.heatmap_loss) * sample_weight
+            total_per_sample = args.alpha * kd_loss + args.beta * gt_loss
+
+            if not args.disable_aux:
+                angle_loss = masked_aux_loss_per_sample(angle_pred, angle_t, mask, aux_valid) * sample_weight
+                length_loss = masked_aux_loss_per_sample(length_pred, length_t, mask, aux_valid) * sample_weight
+                total_per_sample = total_per_sample + args.angle_weight * angle_loss
+                total_per_sample = total_per_sample + args.length_weight * length_loss
+
+            use_ohem = args.ohem_ratio < 1.0 and epoch >= args.ohem_start_epoch
+            loss = apply_ohem(total_per_sample, args.ohem_ratio, enabled=use_ohem)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -359,12 +419,12 @@ def main():
                 avg_loss = total_train_loss / max(valid_train_batches, 1)
                 print(
                     f"  Epoch {epoch + 1} [{batch_index + 1}/{len(train_loader)}] "
-                    f"loss={avg_loss:.5f} | skipped={skipped_train_batches}"
+                    f"loss={avg_loss:.5f} | ohem={'on' if use_ohem else 'off'}"
                 )
 
         scheduler.step()
 
-        val_loss, val_err = evaluate(student, val_loader, device)
+        val_loss, val_err = evaluate(student, val_loader, device, args)
         train_loss = total_train_loss / max(valid_train_batches, 1)
         elapsed_min = (time.time() - t0) / 60.0
 
@@ -374,7 +434,6 @@ def main():
             f"val_loss={val_loss:.5f} | "
             f"val_err={val_err:.2f}px | "
             f"lr={scheduler.get_last_lr()[0]:.2e} | "
-            f"skipped={skipped_train_batches} | "
             f"{elapsed_min:.1f}min"
         )
 
@@ -390,6 +449,7 @@ def main():
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
+            "student_config": args.student_config,
         }
         torch.save(ckpt, os.path.join(args.save_dir, "latest.pth"))
 
@@ -397,7 +457,7 @@ def main():
             torch.save(ckpt, os.path.join(args.save_dir, "best.pth"))
             print(f"  [*] Saved new best checkpoint (val_loss={best_val_loss:.5f})")
 
-        with open(log_path, "a", newline="") as f:
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=log_fields).writerow(
                 {
                     "epoch": epoch + 1,
